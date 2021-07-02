@@ -494,6 +494,7 @@ class PyramidionEncoder(FairseqEncoder):
         # encoder layers
         for layer_i, layer in enumerate(self.layers):
             src_lengths_old, x = self.pooling_pre_layer(x, old_bs, src_lengths_old, layer_i)
+            encoder_padding_mask = torch.zeros(x.shape[1], x.shape[0]).to(x.device).eq(1)
             x = layer(x, encoder_padding_mask=encoder_padding_mask if has_pads else None)
             encoder_padding_mask, x = self.pooling_post_layer(x, encoder_embedding, encoder_states,
                                                               encoder_padding_mask, old_bs,
@@ -538,12 +539,6 @@ class PyramidionEncoder(FairseqEncoder):
                            src_lengths_old, layer_i):
         """After the layer, the pooling is performed"""
         if not self.pooler.is_lambda:
-            encoder_out = EncoderOut(
-                encoder_out=x,  # T x B x C
-                encoder_padding_mask=encoder_padding_mask,  # B x T
-                encoder_embedding=encoder_embedding,  # B x T x C
-                encoder_states=encoder_states,  # List[T x B x C]
-            )
             x = fold_back_maybe(self.pooler, self.args, x, old_bs)
             shp = x.shape
             x = self.pooler(x,
