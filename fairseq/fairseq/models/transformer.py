@@ -699,7 +699,7 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                 self.padding_idx,
                 learned=args.decoder_learned_pos,
             )
-            if not args.no_token_positional_embeddings
+            if (not args.no_token_positional_embeddings and not args.no_decoder_positional_embeddings)
             else None
         )
         export = getattr(args, "export", False)

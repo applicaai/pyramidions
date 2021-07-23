@@ -4,8 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
-from typing import Dict, List, Optional, Tuple
-from typing import NamedTuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -13,23 +12,21 @@ from torch import Tensor
 
 from fairseq import utils
 from fairseq.distributed import fsdp_wrap
-from fairseq.models import (
-    FairseqEncoder,
-    FairseqEncoderDecoderModel,
-    register_model,
-)
-from fairseq.models.transformer import TransformerDecoder, Embedding, TransformerModel
-from fairseq.modules import (
-    FairseqDropout,
-    LayerDropModuleList,
-    LayerNorm,
-    TransformerEncoderLayer,
-)
+from fairseq.models import (FairseqEncoder, FairseqEncoderDecoderModel,
+                            register_model)
+from fairseq.models.transformer import (Embedding, TransformerDecoder,
+                                        TransformerModel)
+from fairseq.modules import (FairseqDropout, LayerDropModuleList, LayerNorm,
+                             PositionalEmbedding,
+                             SinusoidalPositionalEmbedding,
+                             TransformerEncoderLayer)
 from fairseq.modules.checkpoint_activations import checkpoint_wrapper
 from fairseq.modules.quant_noise import quant_noise as apply_quant_noise_
-from .pooler_utils import (unfold_maybe, fold_back_maybe)
-from .positional_embedding import PositionalEmbedding
-from .sinusoidal_positional_embedding import SinusoidalPositionalEmbedding
+
+from .pooler_utils import fold_back_maybe, unfold_maybe
+
+#from .positional_embedding import PositionalEmbedding
+#from .sinusoidal_positional_embedding import SinusoidalPositionalEmbedding
 
 EncoderOut = NamedTuple(
     "EncoderOut",
@@ -334,7 +331,6 @@ class PyramidionEncoder(FairseqEncoder):
                 embed_dim,
                 self.padding_idx,
                 learned=args.encoder_learned_pos,
-                args=args,  # [MP]: use our hacked positional embedings
             )
             if not args.no_token_positional_embeddings
             else None
@@ -392,7 +388,7 @@ class PyramidionEncoder(FairseqEncoder):
             token_embedding = self.embed_tokens(src_tokens)
         x = embed = self.embed_scale * token_embedding
         if self.embed_positions is not None:
-            x = embed + self.embed_positions(src_tokens, chunks_num=self.chunks_num)
+            x = embed + self.embed_positions(src_tokens)
         if self.layernorm_embedding is not None:
             x = self.layernorm_embedding(x)
         x = self.dropout_module(x)
@@ -468,16 +464,22 @@ class PyramidionEncoder(FairseqEncoder):
                   hidden states of shape `(src_len, batch, embed_dim)`.
                   Only populated if *return_all_hiddens* is True.
         """
-        # TODO rozważyć przesunięcie forwardu embeddingów przed unfoldy
-        src_lengths_old = src_lengths
-        src_lengths, src_tokens, old_bs, chunks_num \
-            = unfold_maybe(self.pooler, self.args.chunk_size, self, src_lengths, src_tokens)
-        self.chunks_num = chunks_num
+        # TODO: przyciąć wejście do długości pierwszej warstwy
+        if not hasattr(self, 'pooler_pyramid'):
+            self.build_pooler_pyramid()
+        cut_to_length = self.pooler_pyramid[0]['input_len']     # This is due to the translation task limitations
+        # TODO: limit impact of max_source_positions in the code
+        src_tokens = src_tokens[..., :cut_to_length]
 
         x, encoder_embedding = self.forward_embedding(src_tokens, token_embeddings)
 
+        src_lengths_old = src_lengths
+        src_lengths, x, old_bs, chunks_num \
+            = unfold_maybe(self.pooler, self.args.chunk_size, src_lengths, x)
+
         # compute padding mask
-        encoder_padding_mask = src_tokens.eq(self.padding_idx)
+        encoder_padding_mask = x.eq(0).all(2)
+
         has_pads = src_tokens.device.type == "xla" or encoder_padding_mask.any()
 
         # account for padding while computing the representation
@@ -495,10 +497,8 @@ class PyramidionEncoder(FairseqEncoder):
         # encoder layers
         for layer_i, layer in enumerate(self.layers):
             src_lengths_old, x = self.pooling_pre_layer(x, old_bs, src_lengths_old, layer_i)
-            encoder_padding_mask = torch.zeros(x.shape[1], x.shape[0]).to(x.device).eq(1)
             x = layer(x, encoder_padding_mask=encoder_padding_mask if has_pads else None)
-            encoder_padding_mask, x = self.pooling_post_layer(x, encoder_embedding, encoder_states,
-                                                              encoder_padding_mask, old_bs,
+            encoder_padding_mask, x = self.pooling_post_layer(x, encoder_padding_mask, old_bs,
                                                               src_lengths_old, layer_i)
 
             if return_all_hiddens:
@@ -527,16 +527,16 @@ class PyramidionEncoder(FairseqEncoder):
             self.prepare_hierarchical_pooler(layer_i)
             if layer_i > 0:
                 chunk_size = min(x.shape[0], self.args.chunk_size)
-                self.chunks_num = x.shape[0] // chunk_size
-                src_lengths_old = torch.LongTensor([x.shape[0]] * old_bs).to(x.device)
+                chunks_num = x.shape[0] // chunk_size
+                src_lengths_old = torch.LongTensor([x.shape[0]] * old_bs).to(x.device)  # WTF?
                 x = x.unfold(0, chunk_size, chunk_size) \
                     .permute(1, 0, 3, 2) \
                     .flatten(0, 1) \
                     .transpose(0, 1)  # Len x Batch x Dim
-                assert x.shape[1] == old_bs * self.chunks_num
+                assert x.shape[1] == old_bs * chunks_num
         return src_lengths_old, x
 
-    def pooling_post_layer(self, x, encoder_embedding, encoder_states, encoder_padding_mask, old_bs,
+    def pooling_post_layer(self, x, encoder_padding_mask, old_bs,
                            src_lengths_old, layer_i):
         """After the layer, the pooling is performed"""
         if not self.pooler.is_lambda:
@@ -547,7 +547,6 @@ class PyramidionEncoder(FairseqEncoder):
                             pooled_length=self.pooler.selector.pooled_len,
                             layer_i=layer_i)
             assert x.shape[1:] == shp[1:]
-            #x = encoder_out.encoder_out
 
             # Recreate False-filled mask for layers after pooling,
             # as this is not tractable, and can be assumed without loss of generality
@@ -611,8 +610,6 @@ class PyramidionEncoder(FairseqEncoder):
         """Build pyramid for hierarchical pooler"""
         # set it before pooling for the current layer
         if self.args.enc_layers_and_token_width:
-            if not hasattr(self, 'pooler_pyramid'):
-                self.build_pooler_pyramid()
             layer_settings = self.pooler_pyramid[layer_i]
             self.pooler.pooler_config.input_len = layer_settings['input_len']
             self.pooler.pooler_config.pooled_len = layer_settings['pooled_len']
@@ -641,7 +638,7 @@ class PyramidionEncoder(FairseqEncoder):
             "Too many layers mentioned in the targets of 'enc_layers_and_token_width', " \
             "but not enought encoder layers!"
         pyramid = {}
-        input_len = self.args.max_source_positions
+        input_len = targets[0]  #self.args.max_source_positions
         pooled_len = input_len
         for lay_i in range(max_layer + 1):
             if lay_i in targets:
@@ -657,7 +654,7 @@ class PyramidionEncoder(FairseqEncoder):
         """Maximum input length supported by the encoder."""
         if self.embed_positions is None:
             return self.max_source_positions
-        return min(self.max_source_positions, self.embed_positions.max_positions)
+        return self.embed_positions.max_positions
 
     def upgrade_state_dict_named(self, state_dict, name):
         """Upgrade a (possibly old) state dict for new versions of fairseq."""
@@ -702,7 +699,7 @@ def base_architecture(args):
     args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 8)
     args.decoder_normalize_before = getattr(args, "decoder_normalize_before", False)
     args.decoder_learned_pos = getattr(args, "decoder_learned_pos", False)
-    args.attention_dropout = getattr(args, "attention_dropout", 0.0)
+    args.attention_dropout = getattr(args, "attention_dropout", 0.1)
     args.activation_dropout = getattr(args, "activation_dropout", 0.0)
     args.activation_fn = getattr(args, "activation_fn", "relu")
     args.dropout = getattr(args, "dropout", 0.1)

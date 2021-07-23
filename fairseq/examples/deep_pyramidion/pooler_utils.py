@@ -31,11 +31,10 @@ def fold_back_maybe(pooler, args, encoder_out, old_bs):
     return encoder_out
 
 
-def unfold_maybe(pooler, chunk_size, encoder, doc_lengths, doc_tokens):
+def unfold_maybe(pooler, chunk_size, doc_lengths, x):
     """Prepare docs for encoding (split to 'chunks')"""
 
-    old_bs = doc_tokens.shape[0]
-    chunks_num = 1
+    old_bs = x.shape[0]
     is_blockwise = getattr(pooler.args, "use_sparse_attn", "none") == "only_blockwise"
     stop_blockwise = (
         getattr(pooler.args, "use_sparse_attn", "none") == "pooler_no_block"
@@ -43,42 +42,24 @@ def unfold_maybe(pooler, chunk_size, encoder, doc_lengths, doc_tokens):
     do_unfold = (not pooler.is_lambda and not stop_blockwise) or is_blockwise
     if do_unfold:
         chunks_num = math.ceil(
-            doc_tokens.shape[1] / chunk_size
+            x.shape[1] / chunk_size
         )  # take current batch-document shape
 
-        doc_tokens_padded = _pad(
-            chunk_size, chunks_num, doc_tokens, encoder, old_bs
-        )
-        doc_tokens_unfolded = doc_tokens_padded.unfold(
+        x_padded = _pad_x(chunk_size, chunks_num, x, old_bs)
+
+        x_padded_unfolded = x_padded.unfold(
             1, chunk_size, chunk_size
         ).flatten(0, 1)
 
-        doc_lengths = (doc_tokens_unfolded != 1).sum(axis=1)
-        _inject_eos(doc_lengths, doc_tokens_unfolded, encoder)
+        doc_lengths = (x_padded_unfolded != 0).all(dim=2).sum(axis=1)
     else:
-        doc_tokens_unfolded = doc_tokens
+        x_padded_unfolded = x
+        chunks_num = 1
 
-    return doc_lengths, doc_tokens_unfolded, old_bs, chunks_num
-
-
-def _inject_eos(doc_lengths, doc_tokens_unfolded, encoder):
-    new_bsz = doc_tokens_unfolded.shape[0]
-    ind = (
-        torch.arange(new_bsz, dtype=torch.long, device=doc_lengths.device),
-        doc_lengths - 1,
-    )
-    doc_tokens_unfolded.index_put_(
-        ind,
-        torch.full(
-            (new_bsz,),
-            encoder.dictionary.eos_index,
-            device=doc_lengths.device,
-            dtype=torch.long,
-        ),
-    )
+    return doc_lengths, x_padded_unfolded, old_bs, chunks_num
 
 
-def _pad(chunk_size, chunks_num, doc_tokens, encoder, old_bs):
+def _pad_DEPRECATED(chunk_size, chunks_num, doc_tokens, encoder, old_bs):
     pad_len = (chunks_num * chunk_size) - doc_tokens.shape[1]
     doc_padder = torch.zeros(
         (old_bs, pad_len), dtype=doc_tokens.dtype, device=doc_tokens.device
@@ -91,6 +72,21 @@ def _pad(chunk_size, chunks_num, doc_tokens, encoder, old_bs):
         dim=1,
     )
     return doc_tokens_padded
+
+
+def _pad_x(chunk_size, chunks_num, x, old_bs):
+    pad_len = (chunks_num * chunk_size) - x.shape[1]
+    x_pad = torch.zeros(
+        (old_bs, pad_len, x.shape[2]), dtype=x.dtype, device=x.device
+    ).fill_(0)
+    x_padded = torch.cat(
+        (
+            x,
+            x_pad,
+        ),
+        dim=1,
+    )
+    return x_padded
 
 
 class TopkPooler(Pooler):
