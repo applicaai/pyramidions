@@ -468,8 +468,9 @@ class PyramidionEncoder(FairseqEncoder):
                   hidden states of shape `(src_len, batch, embed_dim)`.
                   Only populated if *return_all_hiddens* is True.
         """
+        # TODO rozważyć przesunięcie forwardu embeddingów przed unfoldy
         src_lengths_old = src_lengths
-        src_lengths, src_tokens_padded, src_tokens, old_bs, chunks_num \
+        src_lengths, src_tokens, old_bs, chunks_num \
             = unfold_maybe(self.pooler, self.args.chunk_size, self, src_lengths, src_tokens)
         self.chunks_num = chunks_num
 
@@ -521,7 +522,7 @@ class PyramidionEncoder(FairseqEncoder):
         }
 
     def pooling_pre_layer(self, x, old_bs, src_lengths_old, layer_i):
-        """Some operations to preprare selection-pooling have to be performed before a layer."""
+        """Some operations to prepare selection-pooling have to be performed before a layer."""
         if not self.pooler.is_lambda:
             self.prepare_hierarchical_pooler(layer_i)
             if layer_i > 0:

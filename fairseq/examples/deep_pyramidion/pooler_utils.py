@@ -34,52 +34,63 @@ def fold_back_maybe(pooler, args, encoder_out, old_bs):
 def unfold_maybe(pooler, chunk_size, encoder, doc_lengths, doc_tokens):
     """Prepare docs for encoding (split to 'chunks')"""
 
-    doc_tokens_unfolded = doc_tokens
     old_bs = doc_tokens.shape[0]
-    doc_tokens_padded = None
     chunks_num = 1
     is_blockwise = getattr(pooler.args, "use_sparse_attn", "none") == "only_blockwise"
     stop_blockwise = (
         getattr(pooler.args, "use_sparse_attn", "none") == "pooler_no_block"
     )
-    if (not pooler.is_lambda and not stop_blockwise) or is_blockwise:
+    do_unfold = (not pooler.is_lambda and not stop_blockwise) or is_blockwise
+    if do_unfold:
         chunks_num = math.ceil(
             doc_tokens.shape[1] / chunk_size
         )  # take current batch-document shape
 
-        pad_len = (chunks_num * chunk_size) - doc_tokens.shape[1]
-        doc_padder = torch.zeros(
-            (old_bs, pad_len), dtype=doc_tokens.dtype, device=doc_tokens.device
-        ).fill_(encoder.dictionary.pad_index)
-        doc_tokens_padded = torch.cat(
-            (
-                doc_tokens,
-                doc_padder,
-            ),
-            dim=1,
+        doc_tokens_padded = _pad(
+            chunk_size, chunks_num, doc_tokens, encoder, old_bs
         )
         doc_tokens_unfolded = doc_tokens_padded.unfold(
             1, chunk_size, chunk_size
         ).flatten(0, 1)
 
         doc_lengths = (doc_tokens_unfolded != 1).sum(axis=1)
-        new_bsz = doc_tokens_unfolded.shape[0]
-        ind = (
-            torch.arange(new_bsz, dtype=torch.long, device=doc_lengths.device),
-            doc_lengths - 1,
-        )
+        _inject_eos(doc_lengths, doc_tokens_unfolded, encoder)
+    else:
+        doc_tokens_unfolded = doc_tokens
 
-        doc_tokens_unfolded.index_put_(
-            ind,
-            torch.full(
-                (new_bsz,),
-                encoder.dictionary.eos_index,
-                device=doc_lengths.device,
-                dtype=torch.long,
-            ),
-        )
+    return doc_lengths, doc_tokens_unfolded, old_bs, chunks_num
 
-    return doc_lengths, doc_tokens_padded, doc_tokens_unfolded, old_bs, chunks_num
+
+def _inject_eos(doc_lengths, doc_tokens_unfolded, encoder):
+    new_bsz = doc_tokens_unfolded.shape[0]
+    ind = (
+        torch.arange(new_bsz, dtype=torch.long, device=doc_lengths.device),
+        doc_lengths - 1,
+    )
+    doc_tokens_unfolded.index_put_(
+        ind,
+        torch.full(
+            (new_bsz,),
+            encoder.dictionary.eos_index,
+            device=doc_lengths.device,
+            dtype=torch.long,
+        ),
+    )
+
+
+def _pad(chunk_size, chunks_num, doc_tokens, encoder, old_bs):
+    pad_len = (chunks_num * chunk_size) - doc_tokens.shape[1]
+    doc_padder = torch.zeros(
+        (old_bs, pad_len), dtype=doc_tokens.dtype, device=doc_tokens.device
+    ).fill_(encoder.dictionary.pad_index)
+    doc_tokens_padded = torch.cat(
+        (
+            doc_tokens,
+            doc_padder,
+        ),
+        dim=1,
+    )
+    return doc_tokens_padded
 
 
 class TopkPooler(Pooler):
@@ -101,9 +112,10 @@ class TopkPooler(Pooler):
             self._set_scorer_architecture()
 
             self._set_softselector_method()
+            # self.bias = nn.Parameter(torch.ones((1, self.args.max_source_positions, 1)))
         else:
             self.scorer = None
-            self.bias = None
+            # self.bias = None        # FIXME remove
 
     def _set_softselector_method(self):
         if self.args.encoder_pooling == "topk":
@@ -154,6 +166,9 @@ class TopkPooler(Pooler):
             assert token_logits.shape[0] == src_lengths.shape[0]
             assert len(token_logits.shape) == 3
             assert token_logits.shape[-1] == 1
+
+            # if self.bias is not None:
+            #     token_logits += self.bias[:, :input_seq_len]
 
             new_token_logits = torch.ones_like(token_logits) * -10000
             for sent_i, slen in enumerate(src_lengths):
