@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+from argparse import Namespace
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
@@ -23,20 +24,7 @@ from fairseq.modules import (FairseqDropout, LayerDropModuleList, LayerNorm,
 from fairseq.modules.checkpoint_activations import checkpoint_wrapper
 from fairseq.modules.quant_noise import quant_noise as apply_quant_noise_
 
-from .pooler_utils import fold_back_maybe, unfold_x_for_blockwise_attention
-
-#from .positional_embedding import PositionalEmbedding
-#from .sinusoidal_positional_embedding import SinusoidalPositionalEmbedding
-
-EncoderOut = NamedTuple(
-    "EncoderOut",
-    [
-        ("encoder_out", Tensor),  # T x B x C
-        ("encoder_padding_mask", Tensor),  # B x T
-        ("encoder_embedding", Tensor),  # B x T x C
-        ("encoder_states", Optional[List[Tensor]]),  # List[T x B x C]
-    ],
-)
+from .pooler import Pooler
 
 
 DEFAULT_MAX_SOURCE_POSITIONS = 1024
@@ -131,6 +119,11 @@ class PyramidionModel(FairseqEncoderDecoderModel):
                             help='Whether to sort-back pooled representations at each step.'
                                  ' This used to be 0 for enc-pool-dec architectures, '
                                  'but in hierarchical sorting, there is a need to sort I believe.')
+        parser.add_argument('--topk-softmax-base', type=int, default=20,
+                            help='The value is a base for exponentiation used in the topk selection'
+                                 'mechanism. The higher the value, the closer the output '
+                                 'to the real hard topk selection, but this may negatively impact '
+                                 'training and the model quality.')
         # ---- POOLER ARGS ----
         parser.add_argument('--no-decoder-positional-embeddings', default=False, action='store_true',
                             help='if set, disables positional embeddings in decoder')
@@ -160,7 +153,7 @@ class PyramidionModel(FairseqEncoderDecoderModel):
                             choices=['pooler', 'only_blockwise', 'pooler_no_block'],
                             help='Type of attention to use. '
                                  '`pooler` uses multihead and blockwise,  '
-                                 '`only_blockwise` uses ')
+                                 '`only_blockwise` uses ')  # TODO: fix documentation
 
 
 
@@ -367,6 +360,8 @@ class PyramidionEncoder(FairseqEncoder):
         else:
             self.layer_norm = None
 
+        self.pooler_pyramid = self.build_pooler_pyramid()
+
     def build_encoder_layer(self, args):
         layer = TransformerEncoderLayer(args)
         checkpoint = getattr(args, "checkpoint_activations", False)
@@ -467,25 +462,20 @@ class PyramidionEncoder(FairseqEncoder):
                   hidden states of shape `(src_len, batch, embed_dim)`.
                   Only populated if *return_all_hiddens* is True.
         """
-        if not hasattr(self, 'pooler_pyramid'):
-            self.build_pooler_pyramid()
-        # TODO: limit impact of max_source_positions in the code
+        original_bs, _ = src_tokens.shape
         src_tokens, src_lengths = self._pad_before_embeddings(src_tokens)
 
         x, encoder_embedding = self.forward_embedding(src_tokens, token_embeddings)
 
-        if self.needs_unfold and not self.pooler.is_lambda:
-            src_lengths, x, old_bs, chunks_num \
-                = unfold_x_for_blockwise_attention(self.args.chunk_size, x)
+        if self.pooler.is_lambda:
+            # compute padding mask
+            encoder_padding_mask = x.eq(0).all(2)
 
-        # compute padding mask
-        encoder_padding_mask = x.eq(0).all(2)
+            has_pads = src_tokens.device.type == "xla" or encoder_padding_mask.any()
 
-        has_pads = src_tokens.device.type == "xla" or encoder_padding_mask.any()
-
-        # account for padding while computing the representation
-        if has_pads:
-            x = x * (1 - encoder_padding_mask.unsqueeze(-1).type_as(x))
+            # account for padding while computing the representation
+            if has_pads:
+                x = x * (1 - encoder_padding_mask.unsqueeze(-1).type_as(x))
 
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
@@ -500,12 +490,10 @@ class PyramidionEncoder(FairseqEncoder):
             if self.pooler.is_lambda:
                 x = layer(x, encoder_padding_mask=encoder_padding_mask if has_pads else None)
             else:
-                src_lengths_before_unfold = torch.LongTensor([x.shape[0]] * old_bs).to(x.device)
-                x = self.pooling_pre_layer(x, old_bs, layer_i)
-                x = layer(x, encoder_padding_mask=encoder_padding_mask if has_pads else None)
-                encoder_padding_mask, x = self.pooling_post_layer(x, encoder_padding_mask, old_bs,
-                                                                  src_lengths_before_unfold,
-                                                                  layer_i)
+                x = self.unfold_maybe(x, layer_i)
+                x = layer(x, encoder_padding_mask=None)
+                x = self.fold_back_maybe(x, original_bs)
+                x = self.pooler(x, layer_i=layer_i)
 
             if return_all_hiddens:
                 assert encoder_states is not None
@@ -514,6 +502,8 @@ class PyramidionEncoder(FairseqEncoder):
         if self.layer_norm is not None:
             x = self.layer_norm(x)
 
+        encoder_padding_mask = self._recreate_masks(x)
+        assert encoder_padding_mask.shape[0] == original_bs
         # The Pytorch Mobile lite interpreter does not supports returning NamedTuple in
         # `forward` so we use a dictionary instead.
         # TorchScript does not support mixed values so the values are all lists.
@@ -527,7 +517,8 @@ class PyramidionEncoder(FairseqEncoder):
             "src_lengths": [],
         }
 
-    def _pad_before_embeddings(self, src_tokens):
+    def _pad_before_embeddings(self, src_tokens: torch.Tensor):
+        """Pad tokens to the input length of the first layer. """
         bs, input_len = src_tokens.shape
         cut_to_length = self.pooler_pyramid[0][
             'input_len']  # This is due to the translation task limitations
@@ -538,36 +529,40 @@ class PyramidionEncoder(FairseqEncoder):
         src_lengths = torch.LongTensor([cut_to_length]*bs, device=src_tokens.device)
         return src_padded, src_lengths
 
-    def pooling_pre_layer(self, x, old_bs, layer_i):
+    def unfold_maybe(self, x, layer_i):
         """Some operations to prepare selection-pooling have to be performed before a layer."""
         self.prepare_hierarchical_pooler(layer_i)
-        if layer_i > 0:
+        if self.needs_unfold:
             chunk_size = min(x.shape[0], self.args.chunk_size)
-            chunks_num = x.shape[0] // chunk_size
             x = x.unfold(0, chunk_size, chunk_size) \
                 .permute(1, 0, 3, 2) \
                 .flatten(0, 1) \
                 .transpose(0, 1)  # Len x Batch x Dim
-            assert x.shape[1] == old_bs * chunks_num
         return x
 
-    def pooling_post_layer(self, x, encoder_padding_mask, old_bs,
-                           src_lengths_before_unfold, layer_i):
-        """After the layer, the pooling is performed"""
-        if not self.pooler.is_lambda:
-            x = fold_back_maybe(self.pooler, self.args, x, old_bs)
-            shp = x.shape
-            x = self.pooler(x,
-                            src_lengths=src_lengths_before_unfold,
-                            pooled_length=self.pooler.selector.pooled_len,
-                            layer_i=layer_i)
-            assert x.shape[1:] == shp[1:]
+    def _recreate_masks(self, x):
+        """Recreate False-filled mask for layers after pooling,
+        as this is not tractable, and can be assumed without loss of generality"""
+        encoder_padding_mask = x.eq(0).all(2).transpose(0, 1)
+        return encoder_padding_mask
 
-            # Recreate False-filled mask for layers after pooling,
-            # as this is not tractable, and can be assumed without loss of generality
-            encoder_padding_mask = x.eq(0).all(2)
-            encoder_padding_mask = torch.zeros(x.shape[1], x.shape[0]).to(x.device).eq(1)
-        return encoder_padding_mask, x
+    def fold_back_maybe(self, encoder_out, old_bs):
+        """Documents are already chunked, put them back to the old shape (from before pooling)"""
+        if self.needs_unfold:
+            # combine chunks back to original batches,
+            # but with shorter length (pooled in the 1st dim)
+            # this can be achieved by tiling the tensors
+            hidden_dim = encoder_out.shape[2]
+            enc = encoder_out.shape
+            assert enc[1] % old_bs == 0
+            assert enc[2] == self.args.encoder_embed_dim
+
+            encoder_out = (
+                encoder_out.transpose(0, 1)
+                    .reshape([old_bs, -1, hidden_dim])
+                    .transpose(0, 1)
+            )
+        return encoder_out
 
     @torch.jit.export
     def reorder_encoder_out(self, encoder_out: Dict[str, List[Tensor]], new_order):
@@ -654,7 +649,7 @@ class PyramidionEncoder(FairseqEncoder):
             "Too many layers mentioned in the targets of 'enc_layers_and_token_width', " \
             "but not enought encoder layers!"
         pyramid = {}
-        input_len = targets[0]  #self.args.max_source_positions
+        input_len = self.args.max_source_positions
         pooled_len = input_len
         for lay_i in range(max_layer + 1):
             if lay_i in targets:
@@ -663,8 +658,8 @@ class PyramidionEncoder(FairseqEncoder):
             input_len = pooled_len
             pyramid[lay_i] = layer_settings
         for k, v in pyramid.items():
-            print(k, ': ', v)
-        self.pooler_pyramid = pyramid
+            print(f'Layer {k} :  {v}')
+        return pyramid
 
     def max_positions(self):
         """Maximum input length supported by the encoder."""
@@ -699,7 +694,7 @@ class PyramidionEncoder(FairseqEncoder):
     @property
     def needs_unfold(self):
         types_where_blockwise_needed = ['pooler', 'only_blockwise']
-        return self.args['use_sparse_attn'] in types_where_blockwise_needed
+        return self.args.use_sparse_attn in types_where_blockwise_needed
 
 
 #@register_model_architecture("pyramidion", "pyramidion_base")
@@ -765,3 +760,4 @@ def base_architecture(args):
     # TODO: specify Pyramidion-specific args in model definitions (base, large etc.)
 
     # TODO: load the originally trained models (&convert them)
+
