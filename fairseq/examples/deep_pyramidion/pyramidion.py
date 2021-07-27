@@ -23,7 +23,7 @@ from fairseq.modules import (FairseqDropout, LayerDropModuleList, LayerNorm,
 from fairseq.modules.checkpoint_activations import checkpoint_wrapper
 from fairseq.modules.quant_noise import quant_noise as apply_quant_noise_
 
-from .pooler_utils import fold_back_maybe, unfold_maybe
+from .pooler_utils import fold_back_maybe, unfold_x_for_blockwise_attention
 
 #from .positional_embedding import PositionalEmbedding
 #from .sinusoidal_positional_embedding import SinusoidalPositionalEmbedding
@@ -157,8 +157,11 @@ class PyramidionModel(FairseqEncoderDecoderModel):
 
         # ---- SPARSE ATTENTION SPECIFIC ----
         parser.add_argument('--use-sparse-attn', type=str, default='pooler',
-                            choices=['only_blockwise', 'pooler', 'pooler_no_block'],
-                            help='type of attention to use. pooler uses multihead')
+                            choices=['pooler', 'only_blockwise', 'pooler_no_block'],
+                            help='Type of attention to use. '
+                                 '`pooler` uses multihead and blockwise,  '
+                                 '`only_blockwise` uses ')
+
 
 
     @classmethod
@@ -464,18 +467,16 @@ class PyramidionEncoder(FairseqEncoder):
                   hidden states of shape `(src_len, batch, embed_dim)`.
                   Only populated if *return_all_hiddens* is True.
         """
-        # TODO: przyciąć wejście do długości pierwszej warstwy
         if not hasattr(self, 'pooler_pyramid'):
             self.build_pooler_pyramid()
-        cut_to_length = self.pooler_pyramid[0]['input_len']     # This is due to the translation task limitations
         # TODO: limit impact of max_source_positions in the code
-        src_tokens = src_tokens[..., :cut_to_length]
+        src_tokens, src_lengths = self._pad_before_embeddings(src_tokens)
 
         x, encoder_embedding = self.forward_embedding(src_tokens, token_embeddings)
 
-        src_lengths_old = src_lengths
-        src_lengths, x, old_bs, chunks_num \
-            = unfold_maybe(self.pooler, self.args.chunk_size, src_lengths, x)
+        if self.needs_unfold and not self.pooler.is_lambda:
+            src_lengths, x, old_bs, chunks_num \
+                = unfold_x_for_blockwise_attention(self.args.chunk_size, x)
 
         # compute padding mask
         encoder_padding_mask = x.eq(0).all(2)
@@ -496,10 +497,15 @@ class PyramidionEncoder(FairseqEncoder):
 
         # encoder layers
         for layer_i, layer in enumerate(self.layers):
-            src_lengths_old, x = self.pooling_pre_layer(x, old_bs, src_lengths_old, layer_i)
-            x = layer(x, encoder_padding_mask=encoder_padding_mask if has_pads else None)
-            encoder_padding_mask, x = self.pooling_post_layer(x, encoder_padding_mask, old_bs,
-                                                              src_lengths_old, layer_i)
+            if self.pooler.is_lambda:
+                x = layer(x, encoder_padding_mask=encoder_padding_mask if has_pads else None)
+            else:
+                src_lengths_before_unfold = torch.LongTensor([x.shape[0]] * old_bs).to(x.device)
+                x = self.pooling_pre_layer(x, old_bs, layer_i)
+                x = layer(x, encoder_padding_mask=encoder_padding_mask if has_pads else None)
+                encoder_padding_mask, x = self.pooling_post_layer(x, encoder_padding_mask, old_bs,
+                                                                  src_lengths_before_unfold,
+                                                                  layer_i)
 
             if return_all_hiddens:
                 assert encoder_states is not None
@@ -521,35 +527,45 @@ class PyramidionEncoder(FairseqEncoder):
             "src_lengths": [],
         }
 
-    def pooling_pre_layer(self, x, old_bs, src_lengths_old, layer_i):
+    def _pad_before_embeddings(self, src_tokens):
+        bs, input_len = src_tokens.shape
+        cut_to_length = self.pooler_pyramid[0][
+            'input_len']  # This is due to the translation task limitations
+        src_tokens = src_tokens[..., :cut_to_length]
+        src_padded = torch.ones(bs, cut_to_length, dtype=src_tokens.dtype,
+                                device=src_tokens.device).fill_(self.dictionary.pad_index)
+        src_padded[:, :input_len] = src_tokens
+        src_lengths = torch.LongTensor([cut_to_length]*bs, device=src_tokens.device)
+        return src_padded, src_lengths
+
+    def pooling_pre_layer(self, x, old_bs, layer_i):
         """Some operations to prepare selection-pooling have to be performed before a layer."""
-        if not self.pooler.is_lambda:
-            self.prepare_hierarchical_pooler(layer_i)
-            if layer_i > 0:
-                chunk_size = min(x.shape[0], self.args.chunk_size)
-                chunks_num = x.shape[0] // chunk_size
-                src_lengths_old = torch.LongTensor([x.shape[0]] * old_bs).to(x.device)  # WTF?
-                x = x.unfold(0, chunk_size, chunk_size) \
-                    .permute(1, 0, 3, 2) \
-                    .flatten(0, 1) \
-                    .transpose(0, 1)  # Len x Batch x Dim
-                assert x.shape[1] == old_bs * chunks_num
-        return src_lengths_old, x
+        self.prepare_hierarchical_pooler(layer_i)
+        if layer_i > 0:
+            chunk_size = min(x.shape[0], self.args.chunk_size)
+            chunks_num = x.shape[0] // chunk_size
+            x = x.unfold(0, chunk_size, chunk_size) \
+                .permute(1, 0, 3, 2) \
+                .flatten(0, 1) \
+                .transpose(0, 1)  # Len x Batch x Dim
+            assert x.shape[1] == old_bs * chunks_num
+        return x
 
     def pooling_post_layer(self, x, encoder_padding_mask, old_bs,
-                           src_lengths_old, layer_i):
+                           src_lengths_before_unfold, layer_i):
         """After the layer, the pooling is performed"""
         if not self.pooler.is_lambda:
             x = fold_back_maybe(self.pooler, self.args, x, old_bs)
             shp = x.shape
             x = self.pooler(x,
-                            src_lengths=src_lengths_old,
+                            src_lengths=src_lengths_before_unfold,
                             pooled_length=self.pooler.selector.pooled_len,
                             layer_i=layer_i)
             assert x.shape[1:] == shp[1:]
 
             # Recreate False-filled mask for layers after pooling,
             # as this is not tractable, and can be assumed without loss of generality
+            encoder_padding_mask = x.eq(0).all(2)
             encoder_padding_mask = torch.zeros(x.shape[1], x.shape[0]).to(x.device).eq(1)
         return encoder_padding_mask, x
 
@@ -679,6 +695,11 @@ class PyramidionEncoder(FairseqEncoder):
             self.normalize = False
             state_dict[version_key] = torch.Tensor([1])
         return state_dict
+
+    @property
+    def needs_unfold(self):
+        types_where_blockwise_needed = ['pooler', 'only_blockwise']
+        return self.args['use_sparse_attn'] in types_where_blockwise_needed
 
 
 #@register_model_architecture("pyramidion", "pyramidion_base")
