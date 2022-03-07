@@ -88,16 +88,15 @@ class SinusoidalPositionalEmbedding(nn.Module):
                 )
             return self.weights[self.padding_idx + pos, :].expand(bsz, 1, -1)
 
-        if getattr(self.args, 'global_positions', 0):
+        use_global_positions = getattr(self.args, 'global_positions', 0)
+        if use_global_positions:
             # use `chunks_num` calculated in unfold
-            # nie global -> lokalne, do 512(x) pocięte
             ins = input.view(input.shape[0] // chunks_num, -1)
             positions = utils.make_positions(
                 ins, self.padding_idx, onnx_trace=self.onnx_trace
             )
             positions = positions.view(input.shape[0], -1)
         else:
-            # globalne
             positions = utils.make_positions(
                 input, self.padding_idx, onnx_trace=self.onnx_trace
             )
