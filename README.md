@@ -7,7 +7,7 @@ complementing our paper _Sparsifying Transformer Models with Trainable Represent
 
 The detailed README on how to use it is provided in [examples](./fairseq/examples/deep_pyramidion/README.md). See [fairseq/examples/deep_pyramidion](./fairseq/examples/deep_pyramidion/) for more.
 
-[[arXiv](https://arxiv.org/abs/2009.05169), [BibTeX](https://dblp.uni-trier.de/rec/journals/corr/abs-2009-05169.html?view=bibtex)]
+[[arXiv](https://arxiv.org/abs/2009.05169), [BibTeX](./cite.bib)]
 
 ## General information
 
